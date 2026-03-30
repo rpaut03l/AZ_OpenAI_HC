@@ -122,7 +122,7 @@ jobs:
           # Add or remove entries here to change which hosts are monitored.
           declare -A HOSTS
           HOSTS["www.rohitpatel.in"]="RohitPatel.in"
-          HOSTS["www.rohitpatel.ai"]="RohitPatel.ai"
+          HOSTS["www.google.com"]="google.com"
           # HOSTS["your-domain.com"]="YourDomain"   # ← add more hosts here
 
           WARN_DAYS=30        # SSL warning threshold  — raise RITM at < 30 days
@@ -339,7 +339,7 @@ jobs:
           # Format matches what analyze.py expects: checks[].overall, .host, .name etc.
           CHECKS='[]'
 
-          for host in "www.rohitpatel.in:RohitPatel.in" "www.rohitpatel.ai:RohitPatel.ai"; do
+          for host in "www.rohitpatel.in:RohitPatel.in" "www.google.com:google.com"; do
             HOST_ADDR="${host%%:*}"
             HOST_NAME="${host##*:}"
 
