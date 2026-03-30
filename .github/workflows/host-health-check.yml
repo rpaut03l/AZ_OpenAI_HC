@@ -322,36 +322,92 @@ jobs:
             echo "timestamp=$TIMESTAMP"
           } >> "$GITHUB_OUTPUT"
 
-      # ── Save raw probe JSON for artifact + analyze.py ──────────────────────
+      # ── Save probe results as JSON — used by analyze.py ───────────────────
+      # IMPORTANT: analyze.py reads RESULTS_FILE which defaults to
+      # /tmp/health_results.json. This step writes that exact file
+      # in the format analyze.py expects: {timestamp, checks:[{...}]}
       - name: Save probe results JSON
         if: always()
         run: |
+          TIMESTAMP="${{ steps.check.outputs.timestamp }}"
+          OVERALL="${{ steps.check.outputs.overall_status }}"
+          PORT_HOSTS="${{ steps.check.outputs.port_issue_hosts }}"
+          SSL_HOSTS="${{ steps.check.outputs.ssl_issue_hosts }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Build checks array — one entry per host
+          # Format matches what analyze.py expects: checks[].overall, .host, .name etc.
+          CHECKS='[]'
+
+          for host in "www.rohitpatel.in:RohitPatel.in" "www.rohitpatel.ai:RohitPatel.ai"; do
+            HOST_ADDR="${host%%:*}"
+            HOST_NAME="${host##*:}"
+
+            # Determine overall status for this host
+            HOST_OVERALL="healthy"
+            HOST_ISSUES='[]'
+            PORT80="open"; PORT443="open"; SSL_STATUS="VALID"
+            SSL_EXPIRY=""; SSL_DAYS="null"
+
+            # Check if this host appears in port issue list
+            if echo "$PORT_HOSTS" | grep -q "$HOST_ADDR"; then
+              HOST_OVERALL="degraded"
+              PORT80="closed"; PORT443="closed"
+              HOST_ISSUES=$(echo "$HOST_ISSUES" | jq '. + ["port_80_closed","port_443_closed"]')
+              SSL_STATUS="SKIPPED"
+            fi
+
+            # Check if this host appears in ssl issue list
+            if echo "$SSL_HOSTS" | grep -q "$HOST_ADDR"; then
+              HOST_OVERALL="degraded"
+              # Extract ssl info from ssl_issue_hosts format: host::name::issue::days::expiry
+              SSL_ENTRY=$(echo "$SSL_HOSTS" | tr '|' '\n' | grep "$HOST_ADDR" | head -1)
+              SSL_ISSUE=$(echo "$SSL_ENTRY"  | cut -d: -f5)
+              SSL_DAYS_VAL=$(echo "$SSL_ENTRY" | cut -d: -f7)
+              SSL_EXPIRY_VAL=$(echo "$SSL_ENTRY" | cut -d: -f9)
+              HOST_ISSUES=$(echo "$HOST_ISSUES" | jq --arg i "$SSL_ISSUE" '. + [$i]')
+              [ -n "$SSL_DAYS_VAL"   ] && SSL_DAYS="$SSL_DAYS_VAL"
+              [ -n "$SSL_EXPIRY_VAL" ] && SSL_EXPIRY="$SSL_EXPIRY_VAL"
+              # Set SSL status from issue string
+              echo "$SSL_ISSUE" | grep -qi "expired"  && SSL_STATUS="EXPIRED"
+              echo "$SSL_ISSUE" | grep -qi "critical" && SSL_STATUS="CRITICAL"
+              echo "$SSL_ISSUE" | grep -qi "warning"  && SSL_STATUS="WARNING"
+            fi
+
+            ENTRY=$(jq -n \
+              --arg  name    "$HOST_NAME" \
+              --arg  host    "$HOST_ADDR" \
+              --arg  p80     "$PORT80" \
+              --arg  p443    "$PORT443" \
+              --arg  ssl     "$SSL_STATUS" \
+              --arg  expiry  "$SSL_EXPIRY" \
+              --argjson days "$SSL_DAYS" \
+              --argjson issues "$HOST_ISSUES" \
+              --arg  overall "$HOST_OVERALL" \
+              '{name:$name,host:$host,env:"personal",
+                port_80:$p80,port_443:$p443,
+                ssl_status:$ssl,ssl_expiry:$expiry,
+                ssl_days_left:$days,ssl_subject:"",ssl_issuer:"",
+                issues:$issues,overall:$overall}')
+
+            CHECKS=$(echo "$CHECKS" | jq --argjson e "$ENTRY" '. + [$e]')
+          done
+
+          # Write final JSON — this is the file analyze.py reads
           jq -n \
-            --arg ts              "${{ steps.check.outputs.timestamp }}" \
-            --arg overall_status  "${{ steps.check.outputs.overall_status }}" \
-            --arg has_port_issues "${{ steps.check.outputs.has_port_issues }}" \
-            --arg has_ssl_issues  "${{ steps.check.outputs.has_ssl_issues }}" \
-            --arg port_hosts      "${{ steps.check.outputs.port_issue_hosts }}" \
-            --arg ssl_hosts       "${{ steps.check.outputs.ssl_issue_hosts }}" \
-            --arg run_url         "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            '{
-              timestamp:        $ts,
-              overall_status:   $overall_status,
-              has_port_issues:  $has_port_issues,
-              has_ssl_issues:   $has_ssl_issues,
-              port_issue_hosts: $port_hosts,
-              ssl_issue_hosts:  $ssl_hosts,
-              gha_run_url:      $run_url
-            }' > /tmp/probe_results.json
-          echo "=== Probe Results ==="
-          cat /tmp/probe_results.json | jq '.'
+            --arg  ts     "$TIMESTAMP" \
+            --argjson checks "$CHECKS" \
+            '{timestamp:$ts, checks:$checks}' > /tmp/health_results.json
+
+          echo "=== health_results.json written ==="
+          cat /tmp/health_results.json | jq '.'
 
       - name: Upload probe results artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: probe-results-${{ github.run_id }}
-          path: /tmp/probe_results.json
+          path: /tmp/health_results.json
           retention-days: 30
 
       # ─────────────────────────────────────────────────────────────────────
@@ -425,6 +481,9 @@ jobs:
           PORT_ISSUE_HOSTS: ${{ steps.check.outputs.port_issue_hosts }}
           SSL_ISSUE_HOSTS:  ${{ steps.check.outputs.ssl_issue_hosts }}
           PROBE_TIMESTAMP:  ${{ steps.check.outputs.timestamp }}
+          # Path to JSON file written by "Save probe results JSON" step above
+          # analyze.py reads this file via the RESULTS_FILE env var
+          RESULTS_FILE: "/tmp/health_results.json"
 
         run: |
           echo "=== LangSmith project: openai-health-check ==="
