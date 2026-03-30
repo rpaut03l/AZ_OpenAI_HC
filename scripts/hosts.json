@@ -1,0 +1,11 @@
+{
+  "hosts": [
+    { "name": "RohitPatel.in",  "host": "www.rohitpatel.in",  "env": "personal" },
+    { "name": "RohitPatel.phd",  "host": "www.rohitpatel.phd",  "env": "notpersonal" }
+  ],
+  "thresholds": {
+    "ssl_warn_days":         30,
+    "ssl_critical_days":      7,
+    "port_timeout_seconds":   5
+  }
+}

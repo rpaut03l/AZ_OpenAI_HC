@@ -1,0 +1,113 @@
+name: Host Health Check — rohitpatel.in + rohitpatel.phd
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'      # every 30 minutes
+  workflow_dispatch:              # manual trigger anytime
+    inputs:
+      approach:
+        description: 'Azure OpenAI approach'
+        required: false
+        default: 'v2_sdk'
+        type: choice
+        options:
+          - v1_rest
+          - v2_sdk
+          - v3_langchain
+          - v4_semantic_kernel
+          - v5_function_calling
+
+jobs:
+  health-check:
+    name: Port + SSL + AI Analysis
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read       # checkout
+      checks:   write      # job summary
+
+    env:
+      GHA_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Install tools ───────────────────────────────────────────────────────
+      - name: Install system tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y netcat-openbsd openssl jq curl
+
+      - name: Install Python deps
+        run: pip install --quiet openai
+
+      # ── Verify Azure OpenAI is reachable ────────────────────────────────────
+      - name: Verify Azure OpenAI connectivity
+        env:
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:  ${{ secrets.AZURE_OPENAI_API_KEY }}
+        run: |
+          echo "=== Endpoint: $AZURE_OPENAI_ENDPOINT ==="
+          echo "=== Listing deployments ==="
+          curl -sf \
+            "${AZURE_OPENAI_ENDPOINT}openai/deployments?api-version=2024-12-01-preview" \
+            -H "api-key: ${AZURE_OPENAI_API_KEY}" \
+            | jq '.data[] | {name:.id, model:.model, status:.status}'
+
+      # ── Quick smoke test ─────────────────────────────────────────────────────
+      - name: Smoke test Azure OpenAI
+        env:
+          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:    ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+        run: |
+          echo "=== Smoke test: $AZURE_OPENAI_DEPLOYMENT ==="
+          RESPONSE=$(curl -sf \
+            "${AZURE_OPENAI_ENDPOINT}openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=2024-12-01-preview" \
+            -H "api-key: ${AZURE_OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}')
+          echo "$RESPONSE" | jq '.choices[0].message.content'
+          echo "=== ✅ Azure OpenAI reachable ==="
+
+      # ── Run port + SSL probes ────────────────────────────────────────────────
+      - name: Run host health probes
+        id: probe
+        run: |
+          chmod +x scripts/host_health_check.sh
+          bash scripts/host_health_check.sh scripts/hosts.json
+        continue-on-error: true   # don't stop workflow if degraded
+
+      # ── Show raw JSON ────────────────────────────────────────────────────────
+      - name: Show raw probe results
+        run: |
+          echo "=== Raw JSON results ==="
+          cat /tmp/health_results.json | jq '.'
+
+      # ── Azure OpenAI analysis → GHA Job Summary ──────────────────────────────
+      - name: Analyze with Azure OpenAI → GHA Summary
+        env:
+          AZURE_OPENAI_ENDPOINT:    ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_KEY:     ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_DEPLOYMENT:  ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+        run: python scripts/analyze.py
+
+      # ── Upload both artifacts ─────────────────────────────────────────────
+      - name: Upload probe results + analysis
+        if: always()                # upload even if probe found issues
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-check-${{ github.run_id }}
+          path: |
+            /tmp/health_results.json
+            /tmp/analysis.md
+          retention-days: 14
+
+      # ── Fail the job if hosts were degraded ───────────────────────────────
+      - name: Fail if degraded hosts found
+        if: steps.probe.outcome == 'failure'
+        run: |
+          echo "🔴 One or more hosts failed health check — see Job Summary above"
+          exit 1
