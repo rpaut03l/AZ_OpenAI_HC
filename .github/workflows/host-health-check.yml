@@ -40,8 +40,8 @@ name: Host Health Check — Port + SSL + Auto Ticketing + LangSmith
 
 on:
   schedule:
-    - cron: '*/30 * * * *'        # Every 30 minutes, all day, every day
-  workflow_dispatch:              # Manual trigger for testing / demo
+    - cron: '*/30 * * * *'      # Every 30 minutes, all day, every day
+  workflow_dispatch:             # Manual trigger for testing / demo
     inputs:
       force_port_issue:
         description: 'Simulate port issue (JIRA ticket demo)'
@@ -585,7 +585,7 @@ jobs:
                     { type: "paragraph", content: [{ type: "text",
                       text: ("Affected hosts: " + $hosts) }] },
                     { type: "paragraph", content: [{ type: "text",
-                      text: "Checks: nc -z -w5 <host> 80  and  nc -z -w5 <host> 443" }] },
+                      text: "Checks: nc -z -w5 HOST 80  and  nc -z -w5 HOST 443" }] },
                     { type: "paragraph", content: [{ type: "text",
                       text: "Investigation: 1) Check firewall/ACL for ports 80/443  2) Verify web server process  3) Check load balancer health  4) Review security group rules" }] },
                     { type: "paragraph", content: [{ type: "text",
@@ -743,27 +743,29 @@ jobs:
           echo "=== Creating ServiceNow RITM ==="
           echo "Affected hosts: $SSL_ISSUE_HOSTS"
 
-          SHORT_DESC="[AUTO] SSL/TLS certificate issue detected — ${TIMESTAMP}"
-          DESCRIPTION="Automated host health check detected SSL/TLS issues.
+          SHORT_DESC="[AUTO] SSL/TLS certificate issue detected - ${TIMESTAMP}"
 
-Timestamp: ${TIMESTAMP}
-GHA Run: ${RUN_URL}
-Affected: ${SSL_ISSUE_HOSTS}
-
-Severity guide:
-  EXPIRED (< 0d)   — Cert expired. HTTPS broken. Fix immediately.
-  CRITICAL (< 7d)  — Expires within 7 days. Renew immediately.
-  WARNING  (< 30d) — Expires within 30 days. Schedule renewal.
-  HANDSHAKE_FAILED — TLS handshake failed. Check cert chain + SNI.
-
-Steps:
-  1. Log into cert management (DigiCert / Let's Encrypt / ACM)
-  2. Renew or reissue for affected domain
-  3. Deploy to all load balancers and web servers
-  4. Verify: echo | openssl s_client -connect <host>:443 -servername <host>
-  5. Confirm days: echo | openssl s_client -connect <host>:443 2>/dev/null | openssl x509 -noout -dates
-
-Auto-created by GitHub Actions — ${GITHUB_REPOSITORY}"
+          DESCRIPTION=$(printf '%s\n' \
+            "Automated host health check detected SSL/TLS issues." \
+            "" \
+            "Timestamp: ${TIMESTAMP}" \
+            "GHA Run: ${RUN_URL}" \
+            "Affected: ${SSL_ISSUE_HOSTS}" \
+            "" \
+            "Severity guide:" \
+            "  EXPIRED (less than 0d)  - Cert expired. HTTPS broken. Fix immediately." \
+            "  CRITICAL (less than 7d) - Expires within 7 days. Renew immediately." \
+            "  WARNING (less than 30d) - Expires within 30 days. Schedule renewal." \
+            "  HANDSHAKE_FAILED - TLS handshake failed. Check cert chain and SNI config." \
+            "" \
+            "Remediation steps:" \
+            "  1. Log into cert management platform (DigiCert, Lets Encrypt, ACM)" \
+            "  2. Renew or reissue certificate for the affected domain" \
+            "  3. Deploy the new cert to all load balancers and web servers" \
+            "  4. Verify using openssl s_client on port 443 with -servername flag" \
+            "  5. Confirm days remaining using openssl x509 -noout -dates" \
+            "" \
+            "Auto-created by GitHub Actions - repo: ${GITHUB_REPOSITORY}")
 
           PAYLOAD=$(jq -n \
             --arg short_desc "$SHORT_DESC" \
