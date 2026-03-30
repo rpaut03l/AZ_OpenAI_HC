@@ -40,7 +40,7 @@ name: Host Health Check — Port + SSL + Auto Ticketing + LangSmith
 
 on:
   schedule:
-    - cron: '*/30 * * * *'      # Every 30 minutes, all day, every day
+    # - cron: '*/30 * * * *'      # Every 30 minutes, all day, every day
   workflow_dispatch:             # Manual trigger for testing / demo
     inputs:
       force_port_issue:
