@@ -463,13 +463,13 @@ jobs:
     if: |
       needs.probe.outputs.has_port_issues == 'true' &&
       inputs.dry_run != 'true' &&
-      secrets.JIRA_BASE_URL != ''
 
     steps:
       # ── Guard step — validates all required JIRA secrets are present ─────────
       # Runs before any curl call so you get a clear error message
       # instead of a cryptic curl 401 / connection refused.
       - name: Validate JIRA secrets are configured
+        id: validate_jira
         env:
           JIRA_BASE_URL:    ${{ secrets.JIRA_BASE_URL }}
           JIRA_USER_EMAIL:  ${{ secrets.JIRA_USER_EMAIL }}
@@ -487,19 +487,19 @@ jobs:
 
           if [ -n "$MISSING" ]; then
             echo ""
-            echo "❌ JIRA secrets not configured. Missing:$MISSING"
+            echo "⚙️  JIRA secrets not configured yet. Missing:$MISSING"
             echo ""
-            echo "To configure:"
-            echo "  Go to: https://github.com/${{ github.repository }}/settings/secrets/actions"
-            echo "  Add each missing secret — see workflow comments for where to find values."
+            echo "To enable JIRA ticket creation, add these secrets at:"
+            echo "  https://github.com/${{ github.repository }}/settings/secrets/actions"
             echo ""
             echo "  JIRA_BASE_URL    → https://YOUR-ORG.atlassian.net"
             echo "  JIRA_USER_EMAIL  → your Atlassian account email"
             echo "  JIRA_API_TOKEN   → https://id.atlassian.com/manage-profile/security/api-tokens"
             echo "  JIRA_PROJECT_KEY → your project key e.g. OPS, INFRA, SRE"
             echo ""
-            echo "Skipping JIRA ticket creation until secrets are configured."
-            exit 1
+            echo "⚙️  Skipping JIRA ticket creation — job will pass without creating a ticket."
+            echo "jira_configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "✅ All JIRA secrets present"
@@ -507,8 +507,10 @@ jobs:
           echo "   JIRA_USER_EMAIL:  $JIRA_USER_EMAIL"
           echo "   JIRA_PROJECT_KEY: $JIRA_PROJECT_KEY"
           echo "   JIRA_API_TOKEN:   [set — not printed for security]"
+          echo "jira_configured=true" >> "$GITHUB_OUTPUT"
 
       - name: Create JIRA ticket via REST API
+        if: steps.validate_jira.outputs.jira_configured == 'true'
         env:
           # ── JIRA secrets ────────────────────────────────────────────────────
 
@@ -657,11 +659,11 @@ jobs:
     if: |
       needs.probe.outputs.has_ssl_issues == 'true' &&
       inputs.dry_run != 'true' &&
-      secrets.SNOW_INSTANCE != ''
 
     steps:
       # ── Guard step — validates all required ServiceNow secrets are present ───
       - name: Validate ServiceNow secrets are configured
+        id: validate_snow
         env:
           SNOW_INSTANCE:  ${{ secrets.SNOW_INSTANCE }}
           SNOW_USERNAME:  ${{ secrets.SNOW_USERNAME }}
@@ -676,26 +678,28 @@ jobs:
 
           if [ -n "$MISSING" ]; then
             echo ""
-            echo "❌ ServiceNow secrets not configured. Missing:$MISSING"
+            echo "⚙️  ServiceNow secrets not configured yet. Missing:$MISSING"
             echo ""
-            echo "To configure:"
-            echo "  Go to: https://github.com/${{ github.repository }}/settings/secrets/actions"
-            echo "  Add each missing secret — see workflow comments for values."
+            echo "To enable ServiceNow RITM creation, add these secrets at:"
+            echo "  https://github.com/${{ github.repository }}/settings/secrets/actions"
             echo ""
             echo "  SNOW_INSTANCE  → your-instance.service-now.com (no https://)"
             echo "  SNOW_USERNAME  → ServiceNow service account username"
             echo "  SNOW_PASSWORD  → ServiceNow service account password"
             echo ""
-            echo "Skipping ServiceNow RITM creation until secrets are configured."
-            exit 1
+            echo "⚙️  Skipping ServiceNow RITM creation — job will pass without creating a RITM."
+            echo "snow_configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "✅ All ServiceNow secrets present"
           echo "   SNOW_INSTANCE:  $SNOW_INSTANCE"
           echo "   SNOW_USERNAME:  $SNOW_USERNAME"
           echo "   SNOW_PASSWORD:  [set — not printed for security]"
+          echo "snow_configured=true" >> "$GITHUB_OUTPUT"
 
       - name: Create ServiceNow RITM via Table API
+        if: steps.validate_snow.outputs.snow_configured == 'true'
         env:
           # ── ServiceNow secrets ───────────────────────────────────────────────
 
