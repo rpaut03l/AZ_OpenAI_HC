@@ -462,7 +462,7 @@ jobs:
     # Add secrets at: Settings → Secrets → Actions → New repository secret
     if: |
       needs.probe.outputs.has_port_issues == 'true' &&
-      inputs.dry_run != 'true' &&
+      inputs.dry_run != 'true'
 
     steps:
       # ── Guard step — validates all required JIRA secrets are present ─────────
@@ -658,7 +658,7 @@ jobs:
     # Add secrets at: Settings → Secrets → Actions → New repository secret
     if: |
       needs.probe.outputs.has_ssl_issues == 'true' &&
-      inputs.dry_run != 'true' &&
+      inputs.dry_run != 'true'
 
     steps:
       # ── Guard step — validates all required ServiceNow secrets are present ───
