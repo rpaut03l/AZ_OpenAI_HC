@@ -1,113 +1,877 @@
-name: Host Health Check — rohitpatel.in + rohitpatel.phd
+name: Host Health Check — Port + SSL + Auto Ticketing + LangSmith
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULE : Runs every 30 minutes automatically via cron
+# MANUAL   : Trigger via workflow_dispatch for testing / demo
+#
+# LOGIC:
+#   Port 80/443 issue  → Create JIRA ticket
+#   SSL/TLS issue      → Create ServiceNow RITM ticket
+#   All healthy        → Silent pass — no tickets, no noise
+#
+# OBSERVABILITY (LangSmith):
+#   Every Azure OpenAI call is traced automatically including:
+#     - Full prompt sent and response received
+#     - Token usage (prompt / completion / total)
+#     - Latency per call (ms)
+#     - Metadata: host names, severity, GHA run URL, deployment name
+#     - Errors with full stack trace if any call fails
+#     - Feedback score per run (1.0 = healthy, 0.0 = degraded)
+#   View traces at: https://smith.langchain.com → project: openai-health-check
+#
+# SECRETS REQUIRED (Settings → Secrets → Actions):
+#   Azure OpenAI:
+#     AZURE_OPENAI_ENDPOINT     — https://rohit-mndifwcq-eastus2.cognitiveservices.azure.com/
+#     AZURE_OPENAI_API_KEY      — from Azure Foundry → deployment → Key field
+#     AZURE_OPENAI_DEPLOYMENT   — gpt-4o-health-check
+#     AZURE_OPENAI_API_VERSION  — 2024-12-01-preview
+#   LangSmith:
+#     LANGSMITH_API_KEY         — from smith.langchain.com → Settings → API Keys
+#   JIRA (for port issue tickets):
+#     JIRA_BASE_URL             — https://YOUR-ORG.atlassian.net
+#     JIRA_USER_EMAIL           — your Atlassian login email
+#     JIRA_API_TOKEN            — from id.atlassian.com/manage-profile/security/api-tokens
+#     JIRA_PROJECT_KEY          — e.g. OPS, INFRA, SRE
+#   ServiceNow (for SSL/TLS tickets):
+#     SNOW_INSTANCE             — dev12345.service-now.com (no https://)
+#     SNOW_USERNAME             — ServiceNow service account username
+#     SNOW_PASSWORD             — ServiceNow service account password
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   schedule:
-    - cron: '*/30 * * * *'      # every 30 minutes
-  workflow_dispatch:              # manual trigger anytime
+    - cron: '*/30 * * * *'      # Every 30 minutes, all day, every day
+  workflow_dispatch:             # Manual trigger for testing / demo
     inputs:
-      approach:
-        description: 'Azure OpenAI approach'
+      force_port_issue:
+        description: 'Simulate port issue (JIRA ticket demo)'
         required: false
-        default: 'v2_sdk'
-        type: choice
-        options:
-          - v1_rest
-          - v2_sdk
-          - v3_langchain
-          - v4_semantic_kernel
-          - v5_function_calling
+        default: 'false'
+        type: boolean
+      force_ssl_issue:
+        description: 'Simulate SSL issue (ServiceNow RITM demo)'
+        required: false
+        default: 'false'
+        type: boolean
+      dry_run:
+        description: 'Dry run — detect + analyze but skip ticket creation'
+        required: false
+        default: 'false'
+        type: boolean
+      skip_ai_analysis:
+        description: 'Skip Azure OpenAI + LangSmith (probe only, no cost)'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
-  health-check:
-    name: Port + SSL + AI Analysis
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 1 — PROBE + AI ANALYSIS
+  # Checks port 80/443 and SSL certs for each host.
+  # Runs Azure OpenAI analysis via LangSmith-traced analyze.py.
+  # Passes results to Jobs 2, 3, 4 via job outputs.
+  # ═══════════════════════════════════════════════════════════════════════════
+  probe:
+    name: 🔍 Probe Hosts + 🤖 AI Analysis
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read       # checkout
-      checks:   write      # job summary
-
-    env:
-      GHA_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+    outputs:
+      has_port_issues:  ${{ steps.check.outputs.has_port_issues  }}
+      has_ssl_issues:   ${{ steps.check.outputs.has_ssl_issues   }}
+      overall_status:   ${{ steps.check.outputs.overall_status   }}
+      port_issue_hosts: ${{ steps.check.outputs.port_issue_hosts }}
+      ssl_issue_hosts:  ${{ steps.check.outputs.ssl_issue_hosts  }}
+      timestamp:        ${{ steps.check.outputs.timestamp        }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Install tools ───────────────────────────────────────────────────────
       - name: Install system tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y netcat-openbsd openssl jq curl
+          sudo apt-get install -y netcat-openbsd openssl jq
 
-      - name: Install Python deps
-        run: pip install --quiet openai
+      # ── Install Python + all AI/observability deps ─────────────────────────
+      # Skipped when skip_ai_analysis=true to save ~20s on probe-only runs
+      - name: Install Python deps (openai + langchain + langsmith)
+        if: inputs.skip_ai_analysis != 'true'
+        run: |
+          pip install --quiet \
+            openai \
+            langsmith \
+            langchain-openai \
+            langchain-core \
+            langchain
 
-      # ── Verify Azure OpenAI is reachable ────────────────────────────────────
-      - name: Verify Azure OpenAI connectivity
+      # ── Main port + SSL probe ──────────────────────────────────────────────
+      - name: Run port + SSL health checks
+        id: check
         env:
-          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY:  ${{ secrets.AZURE_OPENAI_API_KEY }}
+          FORCE_PORT_ISSUE: ${{ inputs.force_port_issue || 'false' }}
+          FORCE_SSL_ISSUE:  ${{ inputs.force_ssl_issue  || 'false' }}
+          # These are not the actual secret values — just empty-or-not signals
+          # used to show ticket integration status in the Job Summary.
+          # GHA replaces secret refs with "" when the secret does not exist.
+          JIRA_BASE_URL_CHECK:  ${{ secrets.JIRA_BASE_URL }}
+          SNOW_INSTANCE_CHECK:  ${{ secrets.SNOW_INSTANCE }}
         run: |
-          echo "=== Endpoint: $AZURE_OPENAI_ENDPOINT ==="
-          echo "=== Listing deployments ==="
-          curl -sf \
-            "${AZURE_OPENAI_ENDPOINT}openai/deployments?api-version=2024-12-01-preview" \
-            -H "api-key: ${AZURE_OPENAI_API_KEY}" \
-            | jq '.data[] | {name:.id, model:.model, status:.status}'
 
-      # ── Quick smoke test ─────────────────────────────────────────────────────
-      - name: Smoke test Azure OpenAI
-        env:
-          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY:    ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          # ── Hosts to check ─────────────────────────────────────────────────
+          # Format: HOSTS["hostname"]="Display Name"
+          # Add or remove entries here to change which hosts are monitored.
+          declare -A HOSTS
+          HOSTS["www.rohitpatel.in"]="RohitPatel.in"
+          HOSTS["www.rohitpatel.ai"]="RohitPatel.ai"
+          # HOSTS["your-domain.com"]="YourDomain"   # ← add more hosts here
+
+          WARN_DAYS=30        # SSL warning threshold  — raise RITM at < 30 days
+          CRITICAL_DAYS=7     # SSL critical threshold — raise RITM at < 7 days
+          TIMEOUT=5           # nc connection timeout in seconds
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          port_issue_hosts=""
+          ssl_issue_hosts=""
+          has_port_issues="false"
+          has_ssl_issues="false"
+          overall_status="healthy"
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  HOST HEALTH CHECK — $TIMESTAMP"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # ── GHA Job Summary — table header ─────────────────────────────────
+          {
+            echo "# 🔍 Host Health Check"
+            echo ""
+            echo "**Run time:** \`$TIMESTAMP\`"
+            echo ""
+            echo "| Host | Port 80 | Port 443 | SSL Status | Expiry | Days Left | Action |"
+            echo "|------|---------|----------|------------|--------|-----------|--------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for host in "${!HOSTS[@]}"; do
+            name="${HOSTS[$host]}"
+            port_issues_this_host=""
+            ssl_issues_this_host=""
+
+            echo ""
+            echo "🔍 Checking: $name ($host)"
+
+            # ── Demo / simulation mode ──────────────────────────────────────
+            if [ "$FORCE_PORT_ISSUE" = "true" ]; then
+              echo "   [DEMO] Simulating port 80 + 443 closed for $host"
+              port_issues_this_host="port_80_closed,port_443_closed"
+              p80="❌ closed (simulated)"; p443="❌ closed (simulated)"
+              ssl_display="⏭️ skipped"; expiry="N/A"; days_left="N/A"
+              row_action="🎫 JIRA ticket"
+
+            elif [ "$FORCE_SSL_ISSUE" = "true" ]; then
+              echo "   [DEMO] Simulating SSL expiry warning (12 days) for $host"
+              ssl_issues_this_host="ssl_warning_12d"
+              p80="✅ open"; p443="✅ open"
+              ssl_display="⚠️ WARNING (12d simulated)"
+              expiry="Apr 12 2026"; days_left="12"
+              row_action="🎫 ServiceNow RITM"
+
+            else
+              # ── Real port 80 check ────────────────────────────────────────
+              echo -n "   Port 80  → "
+              if nc -z -w"$TIMEOUT" "$host" 80 2>/dev/null; then
+                p80="✅ open"; echo "✅ OPEN"
+              else
+                p80="❌ closed"; echo "❌ CLOSED — JIRA ticket will be created"
+                port_issues_this_host="port_80_closed"
+              fi
+
+              # ── Real port 443 check ───────────────────────────────────────
+              echo -n "   Port 443 → "
+              if nc -z -w"$TIMEOUT" "$host" 443 2>/dev/null; then
+                p443="✅ open"; echo "✅ OPEN"
+
+                # ── Real SSL/TLS cert check ───────────────────────────────
+                echo -n "   SSL/TLS  → "
+                cert=$(echo | timeout 10 openssl s_client \
+                  -connect "$host:443" \
+                  -servername "$host" \
+                  -verify_quiet 2>/dev/null | \
+                  openssl x509 -noout -dates -subject -issuer 2>/dev/null) || true
+
+                if [ -z "$cert" ]; then
+                  ssl_display="❌ handshake failed"
+                  echo "❌ HANDSHAKE FAILED — ServiceNow RITM will be created"
+                  ssl_issues_this_host="ssl_handshake_failed"
+                  expiry="N/A"; days_left="N/A"
+                else
+                  not_after=$(echo "$cert" | grep notAfter | cut -d= -f2)
+                  subject=$(echo   "$cert" | grep subject  | sed 's/subject=//')
+                  issuer=$(echo    "$cert" | grep issuer   | sed 's/issuer=//')
+                  exp_epoch=$(date -d "$not_after" +%s 2>/dev/null || echo 0)
+                  now_epoch=$(date +%s)
+                  days=$(( (exp_epoch - now_epoch) / 86400 ))
+                  expiry="$not_after"
+                  days_left="$days"
+
+                  if [ "$days" -lt 0 ]; then
+                    ssl_display="💀 EXPIRED"
+                    echo "💀 EXPIRED — ServiceNow RITM will be created"
+                    ssl_issues_this_host="ssl_expired"
+                  elif [ "$days" -lt "$CRITICAL_DAYS" ]; then
+                    ssl_display="🔴 CRITICAL (${days}d)"
+                    echo "🔴 CRITICAL — ${days} days left — ServiceNow RITM will be created"
+                    ssl_issues_this_host="ssl_critical_${days}d"
+                  elif [ "$days" -lt "$WARN_DAYS" ]; then
+                    ssl_display="⚠️ WARNING (${days}d)"
+                    echo "⚠️  WARNING — ${days} days left — ServiceNow RITM will be created"
+                    ssl_issues_this_host="ssl_warning_${days}d"
+                  else
+                    ssl_display="✅ VALID (${days}d)"
+                    echo "✅ VALID — ${days} days until expiry"
+                  fi
+
+                  echo "   Subject  → $subject"
+                  echo "   Issuer   → $issuer"
+                fi
+              else
+                p443="❌ closed"; ssl_display="⏭️ skipped"
+                echo "❌ CLOSED — JIRA ticket will be created"
+                port_issues_this_host="${port_issues_this_host:+$port_issues_this_host,}port_443_closed"
+                expiry="N/A"; days_left="N/A"
+              fi
+
+              # Determine action column
+              if   [ -n "$port_issues_this_host" ] && [ -n "$ssl_issues_this_host" ]; then
+                row_action="🎫 JIRA + ServiceNow"
+              elif [ -n "$port_issues_this_host" ]; then
+                row_action="🎫 JIRA ticket"
+              elif [ -n "$ssl_issues_this_host" ]; then
+                row_action="🎫 ServiceNow RITM"
+              else
+                row_action="✅ No action"
+              fi
+            fi
+
+            # ── Accumulate issue lists ──────────────────────────────────────
+            if [ -n "$port_issues_this_host" ]; then
+              has_port_issues="true"; overall_status="degraded"
+              port_issue_hosts="${port_issue_hosts:+$port_issue_hosts|}${host}::${name}::${port_issues_this_host}"
+            fi
+            if [ -n "$ssl_issues_this_host" ]; then
+              has_ssl_issues="true"; overall_status="degraded"
+              ssl_issue_hosts="${ssl_issue_hosts:+$ssl_issue_hosts|}${host}::${name}::${ssl_issues_this_host}::${days_left}::${expiry}"
+            fi
+
+            # ── Append row to GHA summary table ────────────────────────────
+            echo "| **$name** \`$host\` | $p80 | $p443 | $ssl_display | \`$expiry\` | $days_left | $row_action |" \
+              >> "$GITHUB_STEP_SUMMARY"
+
+          done  # end host loop
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  OVERALL STATUS : $overall_status"
+          echo "  Port issues    : $has_port_issues"
+          echo "  SSL issues     : $has_ssl_issues"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # ── GHA Job Summary — status footer ────────────────────────────────
+          {
+            echo ""
+            if [ "$overall_status" = "healthy" ]; then
+              echo "## ✅ All hosts healthy — no tickets needed"
+            else
+              echo "## 🔴 Issues detected"
+              [ "$has_port_issues" = "true" ] && \
+                echo "- Port issue found → JIRA ticket job queued"
+              [ "$has_ssl_issues"  = "true" ] && \
+                echo "- SSL issue found  → ServiceNow RITM job queued"
+            fi
+
+            # Show ticket integration status so it is always visible
+            # even when JIRA / ServiceNow secrets are not yet configured.
+            # This prevents confusion about why ticket jobs were skipped.
+            echo ""
+            echo "### ⚙️ Ticket Integration Status"
+            echo ""
+            echo "| Integration | Required Secret | Status |"
+            echo "|-------------|-----------------|--------|"
+
+            if [ -n "$JIRA_BASE_URL_CHECK" ]; then
+              echo "| JIRA (port issues) | \`JIRA_BASE_URL\` | ✅ Configured — ticket will be created |"
+            else
+              echo "| JIRA (port issues) | \`JIRA_BASE_URL\` | ⚙️ Not configured — job will be **skipped** |"
+            fi
+
+            if [ -n "$SNOW_INSTANCE_CHECK" ]; then
+              echo "| ServiceNow (SSL issues) | \`SNOW_INSTANCE\` | ✅ Configured — RITM will be created |"
+            else
+              echo "| ServiceNow (SSL issues) | \`SNOW_INSTANCE\` | ⚙️ Not configured — job will be **skipped** |"
+            fi
+
+            echo ""
+            echo "_To enable: [add secrets here](https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions)_"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ── Set job outputs ─────────────────────────────────────────────────
+          {
+            echo "has_port_issues=$has_port_issues"
+            echo "has_ssl_issues=$has_ssl_issues"
+            echo "overall_status=$overall_status"
+            echo "port_issue_hosts=$port_issue_hosts"
+            echo "ssl_issue_hosts=$ssl_issue_hosts"
+            echo "timestamp=$TIMESTAMP"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── Save raw probe JSON for artifact + analyze.py ──────────────────────
+      - name: Save probe results JSON
+        if: always()
         run: |
-          echo "=== Smoke test: $AZURE_OPENAI_DEPLOYMENT ==="
-          RESPONSE=$(curl -sf \
-            "${AZURE_OPENAI_ENDPOINT}openai/deployments/${AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=2024-12-01-preview" \
-            -H "api-key: ${AZURE_OPENAI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{"messages":[{"role":"user","content":"Say OK"}],"max_tokens":5}')
-          echo "$RESPONSE" | jq '.choices[0].message.content'
-          echo "=== ✅ Azure OpenAI reachable ==="
+          jq -n \
+            --arg ts              "${{ steps.check.outputs.timestamp }}" \
+            --arg overall_status  "${{ steps.check.outputs.overall_status }}" \
+            --arg has_port_issues "${{ steps.check.outputs.has_port_issues }}" \
+            --arg has_ssl_issues  "${{ steps.check.outputs.has_ssl_issues }}" \
+            --arg port_hosts      "${{ steps.check.outputs.port_issue_hosts }}" \
+            --arg ssl_hosts       "${{ steps.check.outputs.ssl_issue_hosts }}" \
+            --arg run_url         "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+              timestamp:        $ts,
+              overall_status:   $overall_status,
+              has_port_issues:  $has_port_issues,
+              has_ssl_issues:   $has_ssl_issues,
+              port_issue_hosts: $port_hosts,
+              ssl_issue_hosts:  $ssl_hosts,
+              gha_run_url:      $run_url
+            }' > /tmp/probe_results.json
+          echo "=== Probe Results ==="
+          cat /tmp/probe_results.json | jq '.'
 
-      # ── Run port + SSL probes ────────────────────────────────────────────────
-      - name: Run host health probes
-        id: probe
-        run: |
-          chmod +x scripts/host_health_check.sh
-          bash scripts/host_health_check.sh scripts/hosts.json
-        continue-on-error: true   # don't stop workflow if degraded
-
-      # ── Show raw JSON ────────────────────────────────────────────────────────
-      - name: Show raw probe results
-        run: |
-          echo "=== Raw JSON results ==="
-          cat /tmp/health_results.json | jq '.'
-
-      # ── Azure OpenAI analysis → GHA Job Summary ──────────────────────────────
-      - name: Analyze with Azure OpenAI → GHA Summary
-        env:
-          AZURE_OPENAI_ENDPOINT:    ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_API_KEY:     ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_DEPLOYMENT:  ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
-          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
-        run: python scripts/analyze.py
-
-      # ── Upload both artifacts ─────────────────────────────────────────────
-      - name: Upload probe results + analysis
-        if: always()                # upload even if probe found issues
+      - name: Upload probe results artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: health-check-${{ github.run_id }}
-          path: |
-            /tmp/health_results.json
-            /tmp/analysis.md
-          retention-days: 14
+          name: probe-results-${{ github.run_id }}
+          path: /tmp/probe_results.json
+          retention-days: 30
 
-      # ── Fail the job if hosts were degraded ───────────────────────────────
-      - name: Fail if degraded hosts found
-        if: steps.probe.outcome == 'failure'
+      # ─────────────────────────────────────────────────────────────────────
+      # AZURE OPENAI + LANGSMITH ANALYSIS
+      # Runs inline in Job 1 so it has access to probe outputs.
+      # Uses scripts/analyze.py which wraps all calls with @traceable
+      # decorators — every run creates one root trace in LangSmith with:
+      #   - load_probe_results span
+      #   - analyze_host_health span (contains the actual Azure OpenAI call)
+      #     └── AzureChatOpenAI span (token counts + latency here)
+      #   - build_gha_summary span
+      # View: https://smith.langchain.com → project: openai-health-check
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Analyze with Azure OpenAI — traced by LangSmith
+        if: inputs.skip_ai_analysis != 'true'
+        env:
+          # ── Azure OpenAI ────────────────────────────────────────────────────
+          # Secret: AZURE_OPENAI_ENDPOINT
+          # Value:  https://rohit-mndifwcq-eastus2.cognitiveservices.azure.com/
+          AZURE_OPENAI_ENDPOINT:    ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+
+          # Secret: AZURE_OPENAI_API_KEY
+          # Value:  from Azure Foundry → your deployment page → eye icon → copy
+          AZURE_OPENAI_API_KEY:     ${{ secrets.AZURE_OPENAI_API_KEY }}
+
+          # Secret: AZURE_OPENAI_DEPLOYMENT
+          # Value:  gpt-4o-health-check  (exact deployment name from Azure Studio)
+          AZURE_OPENAI_DEPLOYMENT:  ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+
+          # Secret: AZURE_OPENAI_API_VERSION
+          # Value:  2024-12-01-preview
+          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
+
+          # ── LangSmith observability ─────────────────────────────────────────
+          # Secret: LANGSMITH_API_KEY
+          # Value:  lsv2_pt_... from smith.langchain.com
+          # Steps to create:
+          #   1. Go to https://smith.langchain.com
+          #   2. Sign in (GitHub / Discord / email)
+          #   3. Top-right avatar → Settings → API Keys → Create API Key
+          #   4. Name: "openai-health-check-gha" → copy the lsv2_pt_... value
+          #   5. Add as GitHub secret: LANGSMITH_API_KEY
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+
+          # LangSmith project — auto-created on first run if it doesn't exist
+          # All traces from this workflow appear under this project name
+          # View at: https://smith.langchain.com → left sidebar → Projects
+          LANGSMITH_PROJECT: "openai-health-check"
+
+          # LangSmith API endpoint
+          # Use https://eu.api.smith.langchain.com if your account is in EU region
+          LANGSMITH_ENDPOINT: "https://api.smith.langchain.com"
+
+          # Activates automatic tracing for all LangChain + AzureChatOpenAI calls
+          # Must be "true" (string) — boolean true will NOT work
+          LANGSMITH_TRACING: "true"
+
+          # ── GHA context — attached as metadata to every LangSmith trace ────
+          # These appear in the LangSmith UI under trace metadata so you can
+          # filter by run_id or actor to find specific GHA runs
+          GITHUB_RUN_ID:      ${{ github.run_id }}
+          GITHUB_ACTOR:       ${{ github.actor }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
+          GITHUB_EVENT_NAME:  ${{ github.event_name }}
+          GHA_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Probe results passed into analyze.py as env vars
+          OVERALL_STATUS:   ${{ steps.check.outputs.overall_status }}
+          HAS_PORT_ISSUES:  ${{ steps.check.outputs.has_port_issues }}
+          HAS_SSL_ISSUES:   ${{ steps.check.outputs.has_ssl_issues }}
+          PORT_ISSUE_HOSTS: ${{ steps.check.outputs.port_issue_hosts }}
+          SSL_ISSUE_HOSTS:  ${{ steps.check.outputs.ssl_issue_hosts }}
+          PROBE_TIMESTAMP:  ${{ steps.check.outputs.timestamp }}
+
         run: |
-          echo "🔴 One or more hosts failed health check — see Job Summary above"
-          exit 1
+          echo "=== LangSmith project: openai-health-check ==="
+          echo "=== Azure deployment:  $AZURE_OPENAI_DEPLOYMENT ==="
+          echo "=== Running analyze.py with full LangSmith tracing ==="
+          python scripts/analyze.py
+          echo "=== Traces visible at: https://smith.langchain.com ==="
+
+      # ── Upload AI analysis markdown artifact ───────────────────────────────
+      - name: Upload AI analysis artifact
+        if: inputs.skip_ai_analysis != 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-analysis-${{ github.run_id }}
+          path: /tmp/analysis.md
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2 — JIRA TICKET
+  # Creates a JIRA bug ticket when port 80 or 443 is unreachable.
+  # Fires ONLY when probe job sets has_port_issues=true AND dry_run=false.
+  # ═══════════════════════════════════════════════════════════════════════════
+  create-jira-ticket:
+    name: 🎫 Create JIRA Ticket (Port Issue)
+    runs-on: ubuntu-latest
+    needs: probe
+
+    # ── Job-level condition ────────────────────────────────────────────────────
+    # This job only starts when:
+    #   1. probe detected port issues (has_port_issues=true)
+    #   2. dry_run is NOT enabled
+    #   3. JIRA_BASE_URL secret is configured (not empty)
+    #
+    # If JIRA secrets are not yet set up → job is SKIPPED (yellow ○) not failed.
+    # Add secrets at: Settings → Secrets → Actions → New repository secret
+    if: |
+      needs.probe.outputs.has_port_issues == 'true' &&
+      inputs.dry_run != 'true' &&
+      secrets.JIRA_BASE_URL != ''
+
+    steps:
+      # ── Guard step — validates all required JIRA secrets are present ─────────
+      # Runs before any curl call so you get a clear error message
+      # instead of a cryptic curl 401 / connection refused.
+      - name: Validate JIRA secrets are configured
+        env:
+          JIRA_BASE_URL:    ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL:  ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN:   ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+        run: |
+          echo "=== Checking JIRA secret configuration ==="
+          MISSING=""
+
+          # Check each required secret — print name if empty
+          [ -z "$JIRA_BASE_URL"    ] && MISSING="$MISSING JIRA_BASE_URL"
+          [ -z "$JIRA_USER_EMAIL"  ] && MISSING="$MISSING JIRA_USER_EMAIL"
+          [ -z "$JIRA_API_TOKEN"   ] && MISSING="$MISSING JIRA_API_TOKEN"
+          [ -z "$JIRA_PROJECT_KEY" ] && MISSING="$MISSING JIRA_PROJECT_KEY"
+
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "❌ JIRA secrets not configured. Missing:$MISSING"
+            echo ""
+            echo "To configure:"
+            echo "  Go to: https://github.com/${{ github.repository }}/settings/secrets/actions"
+            echo "  Add each missing secret — see workflow comments for where to find values."
+            echo ""
+            echo "  JIRA_BASE_URL    → https://YOUR-ORG.atlassian.net"
+            echo "  JIRA_USER_EMAIL  → your Atlassian account email"
+            echo "  JIRA_API_TOKEN   → https://id.atlassian.com/manage-profile/security/api-tokens"
+            echo "  JIRA_PROJECT_KEY → your project key e.g. OPS, INFRA, SRE"
+            echo ""
+            echo "Skipping JIRA ticket creation until secrets are configured."
+            exit 1
+          fi
+
+          echo "✅ All JIRA secrets present"
+          echo "   JIRA_BASE_URL:    $JIRA_BASE_URL"
+          echo "   JIRA_USER_EMAIL:  $JIRA_USER_EMAIL"
+          echo "   JIRA_PROJECT_KEY: $JIRA_PROJECT_KEY"
+          echo "   JIRA_API_TOKEN:   [set — not printed for security]"
+
+      - name: Create JIRA ticket via REST API
+        env:
+          # ── JIRA secrets ────────────────────────────────────────────────────
+
+          # Secret: JIRA_BASE_URL
+          # Value:  https://YOUR-ORG.atlassian.net
+          #         e.g. https://acme-corp.atlassian.net
+          #         Find: base URL when logged into your JIRA instance
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+
+          # Secret: JIRA_USER_EMAIL
+          # Value:  your-email@company.com
+          #         The Atlassian account email used to generate the API token below
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+
+          # Secret: JIRA_API_TOKEN
+          # Value:  generate at https://id.atlassian.com/manage-profile/security/api-tokens
+          #         Click "Create API token" → name it "gha-health-check" → copy the value
+          #         Note: this is NOT your JIRA password — it is a separate API token
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+
+          # Secret: JIRA_PROJECT_KEY
+          # Value:  your project key e.g. OPS, INFRA, SRE, NET, PLATFORM
+          #         Find: JIRA → your project → Project settings → Details → Key field
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+
+          # ── JIRA issue field values — update to match your project ──────────
+
+          # JIRA_ISSUE_TYPE: Must exactly match an issue type in your project
+          #   Common values: Bug | Task | Incident | Service Request | Story
+          #   Find yours: JIRA → Project settings → Issue types → copy Name
+          JIRA_ISSUE_TYPE: "Bug"
+
+          # JIRA_PRIORITY: Must exactly match a priority in your JIRA instance
+          #   Common values: Highest | High | Medium | Low | Lowest
+          JIRA_PRIORITY: "High"
+
+          # JIRA_LABELS: JSON array of label strings
+          #   Labels must already exist in JIRA — create by typing into Label field on any ticket
+          JIRA_LABELS: '["sre-auto","host-health","port-check"]'
+
+          # Pass probe outputs
+          PORT_ISSUE_HOSTS: ${{ needs.probe.outputs.port_issue_hosts }}
+          TIMESTAMP:        ${{ needs.probe.outputs.timestamp }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        run: |
+          echo "=== Creating JIRA ticket ==="
+          echo "Affected hosts: $PORT_ISSUE_HOSTS"
+
+          # Build ADF (Atlassian Document Format) payload for JIRA description
+          PAYLOAD=$(jq -n \
+            --arg project    "$JIRA_PROJECT_KEY" \
+            --arg summary    "[AUTO] Port 80/443 unreachable — host health check — ${TIMESTAMP}" \
+            --arg issuetype  "$JIRA_ISSUE_TYPE" \
+            --arg priority   "$JIRA_PRIORITY" \
+            --argjson labels "$JIRA_LABELS" \
+            --arg hosts      "$PORT_ISSUE_HOSTS" \
+            --arg run_url    "$RUN_URL" \
+            --arg ts         "$TIMESTAMP" \
+            '{
+              fields: {
+                project:   { key: $project },
+                summary:   $summary,
+                issuetype: { name: $issuetype },
+                priority:  { name: $priority },
+                labels:    $labels,
+                description: {
+                  type: "doc", version: 1,
+                  content: [
+                    { type: "paragraph", content: [{ type: "text",
+                      text: "Automated host health check detected port connectivity issues." }] },
+                    { type: "paragraph", content: [{ type: "text",
+                      text: ("Timestamp: " + $ts) }] },
+                    { type: "paragraph", content: [{ type: "text",
+                      text: ("Affected hosts: " + $hosts) }] },
+                    { type: "paragraph", content: [{ type: "text",
+                      text: "Checks: nc -z -w5 <host> 80  and  nc -z -w5 <host> 443" }] },
+                    { type: "paragraph", content: [{ type: "text",
+                      text: "Investigation: 1) Check firewall/ACL for ports 80/443  2) Verify web server process  3) Check load balancer health  4) Review security group rules" }] },
+                    { type: "paragraph", content: [{ type: "text",
+                      text: ("GHA Run: " + $run_url) }] }
+                  ]
+                }
+              }
+            }')
+
+          # Auth: Basic base64(email:api_token)
+          AUTH=$(echo -n "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" | base64)
+
+          RESPONSE=$(curl -sf \
+            -X POST \
+            "${JIRA_BASE_URL}/rest/api/3/issue" \
+            -H "Authorization: Basic ${AUTH}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "$PAYLOAD")
+
+          TICKET_KEY=$(echo "$RESPONSE" | jq -r '.key')
+          TICKET_URL="${JIRA_BASE_URL}/browse/${TICKET_KEY}"
+
+          echo "✅ JIRA ticket created: $TICKET_KEY → $TICKET_URL"
+
+          {
+            echo ""
+            echo "## 🎫 JIRA Ticket Created"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Ticket | [$TICKET_KEY]($TICKET_URL) |"
+            echo "| Type | $JIRA_ISSUE_TYPE |"
+            echo "| Priority | $JIRA_PRIORITY |"
+            echo "| Affected hosts | \`$PORT_ISSUE_HOSTS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: DRY RUN — show JIRA ticket preview
+        if: inputs.dry_run == 'true'
+        env:
+          PORT_ISSUE_HOSTS: ${{ needs.probe.outputs.port_issue_hosts }}
+          TIMESTAMP:        ${{ needs.probe.outputs.timestamp }}
+        run: |
+          echo "=== [DRY RUN] JIRA ticket that would be created ==="
+          echo "  Summary:  [AUTO] Port 80/443 unreachable — $TIMESTAMP"
+          echo "  Type:     Bug  |  Priority: High"
+          echo "  Labels:   sre-auto, host-health, port-check"
+          echo "  Hosts:    $PORT_ISSUE_HOSTS"
+          echo "  (No ticket created — dry_run=true)"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 3 — SERVICENOW RITM
+  # Creates a ServiceNow RITM when SSL cert is expiring, expired, or broken.
+  # Fires ONLY when probe job sets has_ssl_issues=true AND dry_run=false.
+  # ═══════════════════════════════════════════════════════════════════════════
+  create-servicenow-ritm:
+    name: 🎫 Create ServiceNow RITM (SSL Issue)
+    runs-on: ubuntu-latest
+    needs: probe
+
+    # ── Job-level condition ────────────────────────────────────────────────────
+    # This job only starts when:
+    #   1. probe detected SSL issues (has_ssl_issues=true)
+    #   2. dry_run is NOT enabled
+    #   3. SNOW_INSTANCE secret is configured (not empty)
+    #
+    # If ServiceNow secrets are not yet set up → job is SKIPPED (yellow ○) not failed.
+    # Add secrets at: Settings → Secrets → Actions → New repository secret
+    if: |
+      needs.probe.outputs.has_ssl_issues == 'true' &&
+      inputs.dry_run != 'true' &&
+      secrets.SNOW_INSTANCE != ''
+
+    steps:
+      # ── Guard step — validates all required ServiceNow secrets are present ───
+      - name: Validate ServiceNow secrets are configured
+        env:
+          SNOW_INSTANCE:  ${{ secrets.SNOW_INSTANCE }}
+          SNOW_USERNAME:  ${{ secrets.SNOW_USERNAME }}
+          SNOW_PASSWORD:  ${{ secrets.SNOW_PASSWORD }}
+        run: |
+          echo "=== Checking ServiceNow secret configuration ==="
+          MISSING=""
+
+          [ -z "$SNOW_INSTANCE"  ] && MISSING="$MISSING SNOW_INSTANCE"
+          [ -z "$SNOW_USERNAME"  ] && MISSING="$MISSING SNOW_USERNAME"
+          [ -z "$SNOW_PASSWORD"  ] && MISSING="$MISSING SNOW_PASSWORD"
+
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "❌ ServiceNow secrets not configured. Missing:$MISSING"
+            echo ""
+            echo "To configure:"
+            echo "  Go to: https://github.com/${{ github.repository }}/settings/secrets/actions"
+            echo "  Add each missing secret — see workflow comments for values."
+            echo ""
+            echo "  SNOW_INSTANCE  → your-instance.service-now.com (no https://)"
+            echo "  SNOW_USERNAME  → ServiceNow service account username"
+            echo "  SNOW_PASSWORD  → ServiceNow service account password"
+            echo ""
+            echo "Skipping ServiceNow RITM creation until secrets are configured."
+            exit 1
+          fi
+
+          echo "✅ All ServiceNow secrets present"
+          echo "   SNOW_INSTANCE:  $SNOW_INSTANCE"
+          echo "   SNOW_USERNAME:  $SNOW_USERNAME"
+          echo "   SNOW_PASSWORD:  [set — not printed for security]"
+
+      - name: Create ServiceNow RITM via Table API
+        env:
+          # ── ServiceNow secrets ───────────────────────────────────────────────
+
+          # Secret: SNOW_INSTANCE
+          # Value:  hostname WITHOUT https://
+          #         e.g. dev12345.service-now.com  or  company.service-now.com
+          SNOW_INSTANCE: ${{ secrets.SNOW_INSTANCE }}
+
+          # Secret: SNOW_USERNAME
+          # Value:  ServiceNow service account username
+          #         Account needs role: itil  or  rest_api_explorer
+          SNOW_USERNAME: ${{ secrets.SNOW_USERNAME }}
+
+          # Secret: SNOW_PASSWORD
+          # Value:  password for the above service account
+          SNOW_PASSWORD: ${{ secrets.SNOW_PASSWORD }}
+
+          # ── RITM field values — update to match your instance ────────────────
+
+          # SNOW_CATALOG_ITEM_SYSID: sys_id of the catalog item
+          #   Find: ServiceNow → Service Catalog → open item → right-click title
+          #         → Copy sys_id  (32-char hex: d41d8cd98f00b204e9800998ecf8427e)
+          SNOW_CATALOG_ITEM_SYSID: "YOUR_CATALOG_ITEM_SYS_ID_HERE"
+
+          # SNOW_ASSIGNMENT_GROUP: Exact group name as it appears in ServiceNow
+          #   Find: ServiceNow → User Administration → Groups → Name column
+          SNOW_ASSIGNMENT_GROUP: "Network Operations"
+
+          # SNOW_ASSIGNED_TO: Individual username (optional — leave "" for group only)
+          SNOW_ASSIGNED_TO: ""
+
+          # SNOW_URGENCY / SNOW_IMPACT: 1=High  2=Medium  3=Low
+          SNOW_URGENCY: "2"
+          SNOW_IMPACT:  "2"
+
+          # SNOW_CATEGORY: Find values: ServiceNow → sc_category table → Name column
+          SNOW_CATEGORY: "Network"
+
+          # Pass probe outputs
+          SSL_ISSUE_HOSTS: ${{ needs.probe.outputs.ssl_issue_hosts }}
+          TIMESTAMP:       ${{ needs.probe.outputs.timestamp }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        run: |
+          echo "=== Creating ServiceNow RITM ==="
+          echo "Affected hosts: $SSL_ISSUE_HOSTS"
+
+          SHORT_DESC="[AUTO] SSL/TLS certificate issue detected — ${TIMESTAMP}"
+          DESCRIPTION="Automated host health check detected SSL/TLS issues.
+
+Timestamp: ${TIMESTAMP}
+GHA Run: ${RUN_URL}
+Affected: ${SSL_ISSUE_HOSTS}
+
+Severity guide:
+  EXPIRED (< 0d)   — Cert expired. HTTPS broken. Fix immediately.
+  CRITICAL (< 7d)  — Expires within 7 days. Renew immediately.
+  WARNING  (< 30d) — Expires within 30 days. Schedule renewal.
+  HANDSHAKE_FAILED — TLS handshake failed. Check cert chain + SNI.
+
+Steps:
+  1. Log into cert management (DigiCert / Let's Encrypt / ACM)
+  2. Renew or reissue for affected domain
+  3. Deploy to all load balancers and web servers
+  4. Verify: echo | openssl s_client -connect <host>:443 -servername <host>
+  5. Confirm days: echo | openssl s_client -connect <host>:443 2>/dev/null | openssl x509 -noout -dates
+
+Auto-created by GitHub Actions — ${GITHUB_REPOSITORY}"
+
+          PAYLOAD=$(jq -n \
+            --arg short_desc "$SHORT_DESC" \
+            --arg desc       "$DESCRIPTION" \
+            --arg ag         "$SNOW_ASSIGNMENT_GROUP" \
+            --arg at         "$SNOW_ASSIGNED_TO" \
+            --arg urgency    "$SNOW_URGENCY" \
+            --arg impact     "$SNOW_IMPACT" \
+            --arg category   "$SNOW_CATEGORY" \
+            --arg cat_item   "$SNOW_CATALOG_ITEM_SYSID" \
+            '{
+              short_description: $short_desc,
+              description:       $desc,
+              assignment_group:  $ag,
+              assigned_to:       $at,
+              urgency:           $urgency,
+              impact:            $impact,
+              category:          $category,
+              cat_item:          $cat_item,
+              state:             "1",
+              contact_type:      "self-service"
+            }')
+
+          AUTH=$(echo -n "${SNOW_USERNAME}:${SNOW_PASSWORD}" | base64)
+
+          # POST to sc_req_item table = RITM
+          # Change to /incident for Incident  or /sc_request for parent Request
+          RESPONSE=$(curl -sf \
+            -X POST \
+            "https://${SNOW_INSTANCE}/api/now/table/sc_req_item" \
+            -H "Authorization: Basic ${AUTH}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "$PAYLOAD")
+
+          RITM_NUMBER=$(echo "$RESPONSE" | jq -r '.result.number')
+          RITM_SYSID=$(echo  "$RESPONSE" | jq -r '.result.sys_id')
+          RITM_URL="https://${SNOW_INSTANCE}/nav_to.do?uri=sc_req_item.do?sys_id=${RITM_SYSID}"
+
+          echo "✅ ServiceNow RITM created: $RITM_NUMBER → $RITM_URL"
+
+          {
+            echo ""
+            echo "## 🎫 ServiceNow RITM Created"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| RITM Number | \`$RITM_NUMBER\` |"
+            echo "| URL | [$RITM_NUMBER]($RITM_URL) |"
+            echo "| Urgency | $SNOW_URGENCY (1=H 2=M 3=L) |"
+            echo "| Assignment Group | $SNOW_ASSIGNMENT_GROUP |"
+            echo "| Affected hosts | \`$SSL_ISSUE_HOSTS\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: DRY RUN — show ServiceNow RITM preview
+        if: inputs.dry_run == 'true'
+        env:
+          SSL_ISSUE_HOSTS: ${{ needs.probe.outputs.ssl_issue_hosts }}
+          TIMESTAMP:       ${{ needs.probe.outputs.timestamp }}
+        run: |
+          echo "=== [DRY RUN] ServiceNow RITM that would be created ==="
+          echo "  Table:   sc_req_item (RITM)"
+          echo "  Urgency: 2 (Medium)  |  Impact: 2 (Medium)"
+          echo "  Group:   Network Operations"
+          echo "  Hosts:   $SSL_ISSUE_HOSTS"
+          echo "  (No RITM created — dry_run=true)"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 4 — ALL HEALTHY
+  # Silent confirmation. Only runs when probe finds zero issues.
+  # No tickets, no noise. Just a clean Job Summary entry + LangSmith link.
+  # ═══════════════════════════════════════════════════════════════════════════
+  all-healthy:
+    name: ✅ All Healthy — No Action
+    runs-on: ubuntu-latest
+    needs: probe
+
+    if: needs.probe.outputs.overall_status == 'healthy'
+
+    steps:
+      - name: Confirm healthy — no action required
+        run: |
+          echo "✅ All hosts healthy — no JIRA ticket, no ServiceNow RITM"
+          echo "   Timestamp:   ${{ needs.probe.outputs.timestamp }}"
+          echo "   Port 80/443: all open"
+          echo "   SSL/TLS:     all valid, no expiry warnings"
+          echo ""
+          echo "   LangSmith traces: https://smith.langchain.com → openai-health-check"
+          echo "   Next check: ~30 minutes"
+
+          {
+            echo ""
+            echo "## ✅ All Hosts Healthy — No Action Taken"
+            echo ""
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| Port 80/443 | ✅ All open |"
+            echo "| SSL/TLS certs | ✅ All valid, no expiry warnings |"
+            echo "| JIRA ticket | ➖ Not created |"
+            echo "| ServiceNow RITM | ➖ Not created |"
+            echo ""
+            echo "### 📊 LangSmith Observability"
+            echo ""
+            echo "This run's Azure OpenAI trace is visible at:"
+            echo "[smith.langchain.com → project: openai-health-check](https://smith.langchain.com)"
+            echo ""
+            echo "Each trace records: prompt, response, token usage, latency, severity score."
+            echo ""
+            echo "---"
+            echo "*Runs every 30 min · Azure OpenAI \`gpt-4o-health-check\` · LangSmith traced*"
+          } >> "$GITHUB_STEP_SUMMARY"
